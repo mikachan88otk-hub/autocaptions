@@ -1,0 +1,873 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create project files
+        run: |
+          cat > 'settings.gradle.kts' <<'KT_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AutoCaptions"
+          include(":app")
+          KT_EOF
+          cat > 'build.gradle.kts' <<'KT_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          KT_EOF
+          cat > 'gradle.properties' <<'KT_EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          KT_EOF
+          mkdir -p 'app'
+          cat > 'app/build.gradle.kts' <<'KT_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.autocaptions"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.autocaptions"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.1"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              lint {
+                  abortOnError = false
+              }
+              packaging {
+                  jniLibs {
+                      useLegacyPackaging = true
+                  }
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-ktx:1.9.1")
+              implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+              implementation("com.google.guava:guava:33.2.1-android")
+
+              // Lecture + export vidéo avec overlay
+              val media3 = "1.4.1"
+              implementation("androidx.media3:media3-exoplayer:$media3")
+              implementation("androidx.media3:media3-ui:$media3")
+              implementation("androidx.media3:media3-transformer:$media3")
+              implementation("androidx.media3:media3-effect:$media3")
+              implementation("androidx.media3:media3-common:$media3")
+
+              // Reconnaissance vocale hors-ligne avec timestamps par mot
+              implementation("net.java.dev.jna:jna:5.13.0@aar")
+              implementation("com.alphacephei:vosk-android:0.3.47")
+          }
+          KT_EOF
+          mkdir -p 'app/src/main'
+          cat > 'app/src/main/AndroidManifest.xml' <<'KT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:label="AutoCaptions"
+                  android:largeHeap="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          KT_EOF
+          mkdir -p 'app/src/main/java/com/example/autocaptions'
+          cat > 'app/src/main/java/com/example/autocaptions/Captions.kt' <<'KT_EOF'
+          package com.example.autocaptions
+
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Typeface
+          import kotlin.math.PI
+          import kotlin.math.min
+          import kotlin.math.pow
+          import kotlin.math.sin
+
+          data class Word(val text: String, val startMs: Long, val endMs: Long)
+
+          /** Un groupe de 1 à 3 mots affiché en même temps (comme sur TikTok / CapCut). */
+          data class Chunk(val words: List<Word>, val showUntilMs: Long) {
+              val startMs: Long get() = words.first().startMs
+          }
+
+          enum class CaptionStyle(val label: String) {
+              POP("Pop jaune"),
+              BOX("Boîte violette"),
+              BOUNCE("Rebond vert")
+          }
+
+          object Captions {
+              fun buildChunks(words: List<Word>, maxWords: Int = 3, maxGapMs: Long = 600): List<Chunk> {
+                  val groups = mutableListOf<List<Word>>()
+                  var cur = mutableListOf<Word>()
+                  for (w in words) {
+                      if (cur.isNotEmpty() && (cur.size >= maxWords || w.startMs - cur.last().endMs > maxGapMs)) {
+                          groups += cur.toList()
+                          cur = mutableListOf()
+                      }
+                      cur += w
+                  }
+                  if (cur.isNotEmpty()) groups += cur.toList()
+
+                  return groups.mapIndexed { i, g ->
+                      val nextStart = groups.getOrNull(i + 1)?.first()?.startMs ?: Long.MAX_VALUE
+                      Chunk(g, min(g.last().endMs + 300, nextStart))
+                  }
+              }
+          }
+
+          private fun easeOutBack(x: Float): Float {
+              val c1 = 1.70158f
+              val c3 = c1 + 1f
+              return 1f + c3 * (x - 1f).pow(3) + c1 * (x - 1f).pow(2)
+          }
+
+          /**
+           * Dessine les sous-titres animés. Utilisé à la fois pour l'aperçu à l'écran
+           * et pour l'export MP4, donc le rendu est identique.
+           */
+          class CaptionRenderer {
+              @Volatile var chunks: List<Chunk> = emptyList()
+              @Volatile var style: CaptionStyle = CaptionStyle.POP
+
+              private val font = Typeface.create("sans-serif-black", Typeface.NORMAL)
+              private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = font }
+              private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  typeface = font
+                  this.style = Paint.Style.STROKE
+                  strokeJoin = Paint.Join.ROUND
+                  color = Color.BLACK
+              }
+              private val box = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              private val yellow = Color.parseColor("#FFE500")
+              private val green = Color.parseColor("#39FF88")
+              private val purple = Color.parseColor("#7C3AED")
+
+              fun draw(canvas: Canvas, w: Int, h: Int, tMs: Long) {
+                  val chunk = chunks.firstOrNull { tMs >= it.startMs && tMs < it.showUntilMs } ?: return
+                  val st = style
+                  val portrait = h >= w
+
+                  var size = min(w, h) * 0.115f
+                  fill.textSize = size
+                  val texts = chunk.words.map { it.text.uppercase() }
+                  var gap = size * 0.28f
+                  var widths = texts.map { fill.measureText(it) }
+                  var total = widths.sum() + gap * (texts.size - 1)
+                  val maxW = w * 0.9f
+                  if (total > maxW) {
+                      val k = maxW / total
+                      size *= k
+                      gap *= k
+                      widths = widths.map { it * k }
+                      total = maxW
+                      fill.textSize = size
+                  }
+                  stroke.textSize = size
+                  stroke.strokeWidth = size * 0.16f
+
+                  val enterAge = (tMs - chunk.startMs).toFloat()
+                  val enter = easeOutBack((enterAge / 220f).coerceIn(0f, 1f))
+                  val a = ((enterAge / 90f).coerceIn(0f, 1f) * 255).toInt()
+                  val baseY = h * (if (portrait) 0.68f else 0.82f) + (1f - enter) * size * 0.5f
+
+                  var active = 0
+                  for (i in chunk.words.indices) if (chunk.words[i].startMs <= tMs) active = i
+
+                  val fm = fill.fontMetrics
+                  var x = (w - total) / 2f
+                  for (i in texts.indices) {
+                      val wordW = widths[i]
+                      val cx = x + wordW / 2f
+                      x += wordW + gap
+
+                      val isActive = i == active
+                      val age = (tMs - chunk.words[i].startMs).toFloat().coerceAtLeast(0f)
+                      var scale = 1f
+                      var dy = 0f
+                      var rot = 0f
+                      if (isActive) {
+                          scale = (0.78f + 0.22f * easeOutBack((age / 200f).coerceIn(0f, 1f))) * 1.1f
+                          if (st == CaptionStyle.BOUNCE) {
+                              val k = (age / 280f).coerceIn(0f, 1f)
+                              dy = -sin(k * PI.toFloat()) * size * 0.2f
+                              rot = sin(age * 0.06f) * 5f * (1f - k)
+                          }
+                      }
+
+                      canvas.save()
+                      canvas.translate(cx, baseY + dy)
+                      canvas.rotate(rot)
+                      canvas.scale(scale, scale)
+
+                      if (isActive && st == CaptionStyle.BOX) {
+                          box.color = purple
+                          box.alpha = a
+                          val pad = size * 0.16f
+                          canvas.drawRoundRect(
+                              -wordW / 2f - pad, fm.ascent * 0.92f - pad * 0.3f,
+                              wordW / 2f + pad, fm.descent + pad * 0.4f,
+                              size * 0.2f, size * 0.2f, box
+                          )
+                      }
+
+                      stroke.color = Color.BLACK
+                      stroke.alpha = a
+                      canvas.drawText(texts[i], -wordW / 2f, 0f, stroke)
+
+                      fill.color = when {
+                          isActive && st == CaptionStyle.POP -> yellow
+                          isActive && st == CaptionStyle.BOUNCE -> green
+                          else -> Color.WHITE
+                      }
+                      fill.alpha = a
+                      canvas.drawText(texts[i], -wordW / 2f, 0f, fill)
+                      canvas.restore()
+                  }
+              }
+          }
+          KT_EOF
+          mkdir -p 'app/src/main/java/com/example/autocaptions'
+          cat > 'app/src/main/java/com/example/autocaptions/Transcriber.kt' <<'KT_EOF'
+          package com.example.autocaptions
+
+          import android.content.Context
+          import android.media.MediaCodec
+          import android.media.MediaExtractor
+          import android.media.MediaFormat
+          import android.net.Uri
+          import org.json.JSONObject
+          import org.vosk.Model
+          import org.vosk.Recognizer
+          import java.nio.ByteOrder
+          import java.nio.ShortBuffer
+
+          /** Décode la piste audio de la vidéo en PCM 16 kHz mono et la passe à Vosk (hors-ligne). */
+          object Transcriber {
+
+              fun transcribe(ctx: Context, uri: Uri, model: Model, onProgress: (Float) -> Unit): List<Word> {
+                  val extractor = MediaExtractor()
+                  extractor.setDataSource(ctx, uri, null)
+
+                  var track = -1
+                  var fmt: MediaFormat? = null
+                  for (i in 0 until extractor.trackCount) {
+                      val f = extractor.getTrackFormat(i)
+                      if (f.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
+                          track = i
+                          fmt = f
+                          break
+                      }
+                  }
+                  if (track < 0 || fmt == null) {
+                      extractor.release()
+                      throw IllegalStateException("Cette vidéo n'a pas de piste audio.")
+                  }
+                  val format = fmt
+                  extractor.selectTrack(track)
+                  val durationUs = if (format.containsKey(MediaFormat.KEY_DURATION)) format.getLong(MediaFormat.KEY_DURATION) else 0L
+
+                  val codec = MediaCodec.createDecoderByType(format.getString(MediaFormat.KEY_MIME)!!)
+                  val rec = Recognizer(model, 16000f)
+                  rec.setWords(true)
+                  val words = mutableListOf<Word>()
+                  val sink = PcmSink(rec, words)
+                  sink.setFormat(format.getInteger(MediaFormat.KEY_SAMPLE_RATE), format.getInteger(MediaFormat.KEY_CHANNEL_COUNT))
+
+                  try {
+                      codec.configure(format, null, null, 0)
+                      codec.start()
+                      val info = MediaCodec.BufferInfo()
+                      var inEos = false
+                      var outEos = false
+                      var lastReport = 0L
+
+                      while (!outEos) {
+                          if (!inEos) {
+                              val i = codec.dequeueInputBuffer(10_000)
+                              if (i >= 0) {
+                                  val buf = codec.getInputBuffer(i)!!
+                                  val n = extractor.readSampleData(buf, 0)
+                                  if (n < 0) {
+                                      codec.queueInputBuffer(i, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                                      inEos = true
+                                  } else {
+                                      codec.queueInputBuffer(i, 0, n, extractor.sampleTime, 0)
+                                      extractor.advance()
+                                  }
+                              }
+                          }
+                          val o = codec.dequeueOutputBuffer(info, 10_000)
+                          when {
+                              o >= 0 -> {
+                                  val out = codec.getOutputBuffer(o)!!
+                                  if (info.size > 0) {
+                                      out.position(info.offset)
+                                      out.limit(info.offset + info.size)
+                                      sink.feed(out.order(ByteOrder.LITTLE_ENDIAN).asShortBuffer())
+                                  }
+                                  codec.releaseOutputBuffer(o, false)
+                                  if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outEos = true
+                                  if (durationUs > 0 && info.presentationTimeUs - lastReport > 500_000) {
+                                      lastReport = info.presentationTimeUs
+                                      onProgress((info.presentationTimeUs.toFloat() / durationUs).coerceIn(0f, 1f))
+                                  }
+                              }
+                              o == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                                  val f = codec.outputFormat
+                                  sink.setFormat(f.getInteger(MediaFormat.KEY_SAMPLE_RATE), f.getInteger(MediaFormat.KEY_CHANNEL_COUNT))
+                              }
+                          }
+                      }
+                      sink.flush()
+                      collect(rec.finalResult, words)
+                  } finally {
+                      try { codec.stop() } catch (_: Exception) {}
+                      codec.release()
+                      extractor.release()
+                      rec.close()
+                  }
+                  return words
+              }
+
+              private fun collect(json: String, out: MutableList<Word>) {
+                  val arr = JSONObject(json).optJSONArray("result") ?: return
+                  for (i in 0 until arr.length()) {
+                      val o = arr.getJSONObject(i)
+                      out += Word(
+                          o.getString("word"),
+                          (o.getDouble("start") * 1000).toLong(),
+                          (o.getDouble("end") * 1000).toLong()
+                      )
+                  }
+              }
+
+              /** Mixe en mono, rééchantillonne à 16 kHz (moyenne par blocs) et envoie à Vosk. */
+              private class PcmSink(val rec: Recognizer, val words: MutableList<Word>) {
+                  private var channels = 1
+                  private var step = 1.0
+                  private var idx = 0.0
+                  private var next = 1.0
+                  private var acc = 0.0
+                  private var cnt = 0
+                  private val buf = ByteArray(8000)
+                  private var n = 0
+
+                  fun setFormat(rate: Int, ch: Int) {
+                      channels = ch
+                      step = rate / 16000.0
+                      idx = 0.0
+                      next = step
+                      acc = 0.0
+                      cnt = 0
+                  }
+
+                  fun feed(sb: ShortBuffer) {
+                      while (sb.remaining() >= channels) {
+                          var s = 0
+                          for (c in 0 until channels) s += sb.get().toInt()
+                          acc += s.toDouble() / channels
+                          cnt++
+                          idx += 1.0
+                          if (idx >= next) {
+                              emit((acc / cnt).toInt().toShort())
+                              acc = 0.0
+                              cnt = 0
+                              next += step
+                          }
+                      }
+                  }
+
+                  private fun emit(v: Short) {
+                      buf[n++] = (v.toInt() and 0xFF).toByte()
+                      buf[n++] = (v.toInt() shr 8).toByte()
+                      if (n == buf.size) flush()
+                  }
+
+                  fun flush() {
+                      if (n > 0) {
+                          if (rec.acceptWaveForm(buf, n)) collect(rec.result, words)
+                          n = 0
+                      }
+                  }
+              }
+          }
+          KT_EOF
+          mkdir -p 'app/src/main/java/com/example/autocaptions'
+          cat > 'app/src/main/java/com/example/autocaptions/ModelStore.kt' <<'KT_EOF'
+          package com.example.autocaptions
+
+          import android.content.Context
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.zip.ZipInputStream
+
+          /** Télécharge (une seule fois) le petit modèle vocal anglais de Vosk (~40 Mo). */
+          object ModelStore {
+              private const val NAME = "vosk-model-small-en-us-0.15"
+              private const val MODEL_URL = "https://alphacephei.com/vosk/models/$NAME.zip"
+
+              fun ensure(ctx: Context, onStatus: (String) -> Unit): File {
+                  val dir = File(ctx.filesDir, NAME)
+                  val marker = File(dir, ".ok")
+                  if (marker.exists()) return dir
+
+                  val zip = File(ctx.cacheDir, "$NAME.zip")
+                  val conn = URL(MODEL_URL).openConnection() as HttpURLConnection
+                  conn.connectTimeout = 20_000
+                  conn.readTimeout = 30_000
+                  val total = conn.contentLength.toLong()
+                  conn.inputStream.use { input ->
+                      zip.outputStream().use { out ->
+                          val buf = ByteArray(64 * 1024)
+                          var done = 0L
+                          var lastPct = -1
+                          while (true) {
+                              val r = input.read(buf)
+                              if (r < 0) break
+                              out.write(buf, 0, r)
+                              done += r
+                              if (total > 0) {
+                                  val pct = (done * 100 / total).toInt()
+                                  if (pct != lastPct) {
+                                      lastPct = pct
+                                      onStatus("Téléchargement du modèle vocal… $pct%")
+                                  }
+                              }
+                          }
+                      }
+                  }
+
+                  onStatus("Installation du modèle vocal…")
+                  val root = ctx.filesDir.canonicalPath
+                  ZipInputStream(zip.inputStream().buffered()).use { zis ->
+                      var e = zis.nextEntry
+                      while (e != null) {
+                          val out = File(ctx.filesDir, e.name)
+                          if (!out.canonicalPath.startsWith(root)) throw SecurityException("Zip invalide")
+                          if (e.isDirectory) {
+                              out.mkdirs()
+                          } else {
+                              out.parentFile?.mkdirs()
+                              out.outputStream().use { zis.copyTo(it) }
+                          }
+                          e = zis.nextEntry
+                      }
+                  }
+                  zip.delete()
+                  marker.createNewFile()
+                  return dir
+              }
+          }
+          KT_EOF
+          mkdir -p 'app/src/main/java/com/example/autocaptions'
+          cat > 'app/src/main/java/com/example/autocaptions/CaptionOverlayView.kt' <<'KT_EOF'
+          package com.example.autocaptions
+
+          import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.view.View
+          import androidx.media3.exoplayer.ExoPlayer
+          import kotlin.math.min
+
+          /** Superpose les sous-titres animés sur la vidéo pendant la lecture. */
+          class CaptionOverlayView(
+              ctx: Context,
+              private val player: ExoPlayer,
+              private val renderer: CaptionRenderer
+          ) : View(ctx) {
+
+              override fun onDraw(canvas: Canvas) {
+                  val vs = player.videoSize
+                  var vw = vs.width
+                  var vh = vs.height
+                  if (vw > 0 && vh > 0) {
+                      if (vs.unappliedRotationDegrees % 180 != 0) { val t = vw; vw = vh; vh = t }
+                      val scale = min(width / vw.toFloat(), height / vh.toFloat())
+                      val rw = vw * scale
+                      val rh = vh * scale
+                      canvas.save()
+                      canvas.translate((width - rw) / 2f, (height - rh) / 2f)
+                      renderer.draw(canvas, rw.toInt(), rh.toInt(), player.currentPosition)
+                      canvas.restore()
+                  }
+                  postInvalidateOnAnimation()
+              }
+          }
+          KT_EOF
+          mkdir -p 'app/src/main/java/com/example/autocaptions'
+          cat > 'app/src/main/java/com/example/autocaptions/Exporter.kt' <<'KT_EOF'
+          package com.example.autocaptions
+
+          import android.app.Activity
+          import android.content.ContentValues
+          import android.graphics.Bitmap
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.media.MediaMetadataRetriever
+          import android.net.Uri
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.MediaStore
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.audio.AudioProcessor
+          import androidx.media3.effect.BitmapOverlay
+          import androidx.media3.effect.OverlayEffect
+          import androidx.media3.transformer.Composition
+          import androidx.media3.transformer.EditedMediaItem
+          import androidx.media3.transformer.Effects
+          import androidx.media3.transformer.ExportException
+          import androidx.media3.transformer.ExportResult
+          import androidx.media3.transformer.ProgressHolder
+          import androidx.media3.transformer.Transformer
+          import com.google.common.collect.ImmutableList
+          import java.io.File
+
+          /** Exporte un MP4 avec les sous-titres incrustés (Media3 Transformer + overlay). */
+          object Exporter {
+
+              fun export(
+                  activity: Activity,
+                  uri: Uri,
+                  renderer: CaptionRenderer,
+                  onProgress: (Int) -> Unit,
+                  onDone: (Uri?, String?) -> Unit
+              ) {
+                  val (w, h) = videoSize(activity, uri)
+                  val overlay = CaptionBitmapOverlay(renderer, w, h)
+                  val effects = Effects(emptyList<AudioProcessor>(), listOf(OverlayEffect(ImmutableList.of(overlay))))
+                  val item = EditedMediaItem.Builder(MediaItem.fromUri(uri)).setEffects(effects).build()
+
+                  val out = File(activity.cacheDir, "captioned_${System.currentTimeMillis()}.mp4")
+                  val handler = Handler(Looper.getMainLooper())
+                  lateinit var transformer: Transformer
+
+                  val poll = object : Runnable {
+                      override fun run() {
+                          val ph = ProgressHolder()
+                          if (transformer.getProgress(ph) != Transformer.PROGRESS_STATE_NOT_STARTED) onProgress(ph.progress)
+                          handler.postDelayed(this, 300)
+                      }
+                  }
+
+                  transformer = Transformer.Builder(activity)
+                      .addListener(object : Transformer.Listener {
+                          override fun onCompleted(composition: Composition, exportResult: ExportResult) {
+                              handler.removeCallbacks(poll)
+                              Thread {
+                                  val saved = try { saveToGallery(activity, out) } catch (e: Exception) { null }
+                                  handler.post { onDone(saved, if (saved == null) "Enregistrement impossible" else null) }
+                              }.start()
+                          }
+
+                          override fun onError(composition: Composition, exportResult: ExportResult, exportException: ExportException) {
+                              handler.removeCallbacks(poll)
+                              onDone(null, exportException.message ?: "erreur inconnue")
+                          }
+                      })
+                      .build()
+
+                  transformer.start(item, out.absolutePath)
+                  handler.post(poll)
+              }
+
+              private fun videoSize(activity: Activity, uri: Uri): Pair<Int, Int> {
+                  val r = MediaMetadataRetriever()
+                  try {
+                      r.setDataSource(activity, uri)
+                      var w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)!!.toInt()
+                      var h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)!!.toInt()
+                      val rot = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toInt() ?: 0
+                      if (rot == 90 || rot == 270) { val t = w; w = h; h = t }
+                      return Pair(w, h)
+                  } finally {
+                      r.release()
+                  }
+              }
+
+              private fun saveToGallery(activity: Activity, file: File): Uri? {
+                  val values = ContentValues().apply {
+                      put(MediaStore.Video.Media.DISPLAY_NAME, "captions_${System.currentTimeMillis()}.mp4")
+                      put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                      put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/AutoCaptions")
+                  }
+                  val dest = activity.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+                  activity.contentResolver.openOutputStream(dest)?.use { o -> file.inputStream().use { it.copyTo(o) } }
+                  file.delete()
+                  return dest
+              }
+
+              /**
+               * Bitmap transparent de la taille de la vidéo, redessiné à chaque image.
+               * Deux bitmaps en alternance : Media3 ne ré-uploade la texture que si l'instance change.
+               */
+              private class CaptionBitmapOverlay(
+                  private val renderer: CaptionRenderer,
+                  private val w: Int,
+                  private val h: Int
+              ) : BitmapOverlay() {
+                  private val bitmaps = arrayOf(
+                      Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888),
+                      Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                  )
+                  private var flip = 0
+
+                  override fun getBitmap(presentationTimeUs: Long): Bitmap {
+                      flip = 1 - flip
+                      val bmp = bitmaps[flip]
+                      bmp.eraseColor(Color.TRANSPARENT)
+                      renderer.draw(Canvas(bmp), w, h, presentationTimeUs / 1000)
+                      return bmp
+                  }
+              }
+          }
+          KT_EOF
+          mkdir -p 'app/src/main/java/com/example/autocaptions'
+          cat > 'app/src/main/java/com/example/autocaptions/MainActivity.kt' <<'KT_EOF'
+          package com.example.autocaptions
+
+          import android.graphics.Color
+          import android.net.Uri
+          import android.os.Bundle
+          import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+          import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+          import android.widget.Button
+          import android.widget.FrameLayout
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import androidx.activity.ComponentActivity
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.lifecycle.lifecycleScope
+          import androidx.media3.common.MediaItem
+          import androidx.media3.exoplayer.ExoPlayer
+          import androidx.media3.ui.PlayerView
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import org.vosk.LibVosk
+          import org.vosk.LogLevel
+          import org.vosk.Model
+
+          class MainActivity : ComponentActivity() {
+
+              private lateinit var exo: ExoPlayer
+              private val renderer = CaptionRenderer()
+              private var videoUri: Uri? = null
+
+              private lateinit var status: TextView
+              private lateinit var btnPick: Button
+              private lateinit var btnGen: Button
+              private lateinit var btnStyle: Button
+              private lateinit var btnExport: Button
+
+              private val picker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                  if (uri != null) loadVideo(uri)
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  LibVosk.setLogLevel(LogLevel.WARNINGS)
+
+                  exo = ExoPlayer.Builder(this).build()
+                  val playerView = PlayerView(this).apply { player = exo }
+                  val overlay = CaptionOverlayView(this, exo, renderer)
+
+                  val frame = FrameLayout(this).apply {
+                      addView(playerView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+                      addView(overlay, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+                  }
+
+                  status = TextView(this).apply {
+                      setTextColor(Color.WHITE)
+                      textSize = 14f
+                      text = "Choisis une vidéo pour commencer."
+                      setPadding(0, dp(8), 0, dp(8))
+                  }
+
+                  btnPick = Button(this).apply { text = "📁 Vidéo"; setOnClickListener { picker.launch("video/*") } }
+                  btnGen = Button(this).apply { text = "✨ Sous-titrer"; isEnabled = false; setOnClickListener { generate() } }
+                  btnStyle = Button(this).apply {
+                      text = "🎨 ${renderer.style.label}"
+                      setOnClickListener {
+                          val all = CaptionStyle.values()
+                          renderer.style = all[(renderer.style.ordinal + 1) % all.size]
+                          text = "🎨 ${renderer.style.label}"
+                      }
+                  }
+                  btnExport = Button(this).apply { text = "💾 Exporter MP4"; isEnabled = false; setOnClickListener { exportVideo() } }
+
+                  fun row(vararg b: Button) = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      b.forEach { addView(it, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)) }
+                  }
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setBackgroundColor(Color.BLACK)
+                      setPadding(dp(12), dp(36), dp(12), dp(12))
+                      addView(frame, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+                      addView(status, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+                      addView(row(btnPick, btnGen), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+                      addView(row(btnStyle, btnExport), LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+                  }
+                  setContentView(root)
+              }
+
+              private fun loadVideo(uri: Uri) {
+                  videoUri = uri
+                  renderer.chunks = emptyList()
+                  exo.setMediaItem(MediaItem.fromUri(uri))
+                  exo.prepare()
+                  exo.playWhenReady = true
+                  btnGen.isEnabled = true
+                  btnExport.isEnabled = false
+                  status.text = "Vidéo chargée. Appuie sur « Sous-titrer »."
+              }
+
+              private fun setBusy(busy: Boolean) {
+                  btnPick.isEnabled = !busy
+                  btnGen.isEnabled = !busy && videoUri != null
+                  btnExport.isEnabled = !busy && renderer.chunks.isNotEmpty()
+              }
+
+              private fun generate() {
+                  val uri = videoUri ?: return
+                  setBusy(true)
+                  exo.pause()
+                  lifecycleScope.launch {
+                      try {
+                          val words = withContext(Dispatchers.Default) {
+                              val dir = ModelStore.ensure(applicationContext) { s -> runOnUiThread { status.text = s } }
+                              status.post { status.text = "Chargement du modèle…" }
+                              val model = Model(dir.absolutePath)
+                              try {
+                                  Transcriber.transcribe(applicationContext, uri, model) { p ->
+                                      runOnUiThread { status.text = "Transcription… ${(p * 100).toInt()}%" }
+                                  }
+                              } finally {
+                                  model.close()
+                              }
+                          }
+                          renderer.chunks = Captions.buildChunks(words)
+                          status.text = if (words.isEmpty()) "Aucune parole détectée." else "✅ ${words.size} mots sous-titrés. Change le style avec 🎨 !"
+                          exo.seekTo(0)
+                          exo.play()
+                      } catch (e: Exception) {
+                          status.text = "Erreur : ${e.message}"
+                      } finally {
+                          setBusy(false)
+                      }
+                  }
+              }
+
+              private fun exportVideo() {
+                  val uri = videoUri ?: return
+                  exo.pause()
+                  setBusy(true)
+                  status.text = "Export… 0%"
+                  try {
+                      Exporter.export(
+                          this, uri, renderer,
+                          onProgress = { p -> status.text = "Export… $p%" },
+                          onDone = { saved, err ->
+                              setBusy(false)
+                              status.text = if (saved != null) "✅ Vidéo enregistrée dans Movies/AutoCaptions" else "Erreur d'export : $err"
+                          }
+                      )
+                  } catch (e: Exception) {
+                      setBusy(false)
+                      status.text = "Erreur : ${e.message}"
+                  }
+              }
+
+              override fun onDestroy() {
+                  exo.release()
+                  super.onDestroy()
+              }
+          }
+          KT_EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+      - name: Build debug APK
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoCaptions-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+      - name: Publish APK in a release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: AutoCaptions APK ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
